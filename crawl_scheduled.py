@@ -1,0 +1,355 @@
+"""
+crawl_scheduled.py ─ 전국 상가 일일 자동 크롤링 (비동기 병렬 버전)
+
+[특징]
+  - JWT는 jwt_refresh.py가 자동 갱신 (NID 쿠키 기반, 약 10초)
+  - 상세 API를 DETAIL_BATCH건씩 asyncio.gather()로 병렬 호출 (enhancement.md 반영)
+  - TokenExpiredError 발생 시 JWT 재갱신 후 해당 지역 재시도
+  - DB_UPSERT_EVERY건마다 Supabase에 스트리밍 UPSERT → 중단 시 데이터 보존
+
+[실행]
+  python crawl_scheduled.py                # 전국
+  python crawl_scheduled.py --sido 경기도  # 특정 시/도만 (테스트용)
+
+[필요 환경변수]
+  NAVER_NID_SES, NAVER_NID_AUT  : Naver NID 쿠키 (3~6개월 유효)
+  SUPABASE_URL, SUPABASE_KEY    : Supabase 프로젝트 정보
+"""
+
+import argparse
+import asyncio
+import os
+import sys
+from datetime import datetime, timezone
+
+import httpx
+
+from crawler_core import (
+    BASE,
+    DTL_ENDPOINT,
+    DELAY_LIST,
+    REGION_ENDPOINT,
+    TokenExpiredError,
+    extract_record,
+    make_headers,
+)
+from db import get_last_crawl, insert_crawl_log, upsert_listings
+from jwt_refresh import get_fresh_jwt
+
+# ── 병렬 처리 파라미터 ────────────────────────────────────────────────────────
+DETAIL_BATCH    = 10    # 동시 상세 요청 수 (429 위험 시 줄이세요)
+DELAY_BATCH     = 0.5   # 배치 완료 후 대기 (초)
+DB_UPSERT_EVERY = 200   # N건마다 Supabase UPSERT (메모리 관리)
+
+# ── URL 상수 ─────────────────────────────────────────────────────────────────
+_LIST_ENDPOINT = BASE + "/api/articles"
+
+
+# ════════════════════════════════════════════════════════════════
+# 인증 정보 컨테이너 (JWT 갱신 시 전역 업데이트)
+# ════════════════════════════════════════════════════════════════
+
+class _Creds:
+    jwt:    str = ""
+    cookie: str = ""
+
+_creds = _Creds()
+
+
+async def _refresh_jwt() -> None:
+    """NID 쿠키로 JWT를 자동 갱신하고 _creds를 업데이트합니다."""
+    nid_ses = os.environ["NAVER_NID_SES"]
+    nid_aut = os.environ["NAVER_NID_AUT"]
+    print("  → JWT 자동 갱신 중 (약 10초)...")
+    _creds.jwt    = await get_fresh_jwt(nid_ses, nid_aut)
+    _creds.cookie = f"NID_SES={nid_ses}; NID_AUT={nid_aut}"
+    print(f"  → JWT 갱신 완료 ({_creds.jwt[:40]}...)")
+
+
+# ════════════════════════════════════════════════════════════════
+# 비동기 API 요청
+# ════════════════════════════════════════════════════════════════
+
+def _build_list_url(cortar_no: str, page: int) -> str:
+    return (
+        f"{_LIST_ENDPOINT}"
+        f"?cortarNo={cortar_no}"
+        f"&order=rank&realEstateType=SG&tradeType=A1"
+        f"&tag=%3A%3A%3A%3A%3A%3A%3A%3A"
+        f"&rentPriceMin=0&rentPriceMax=900000000"
+        f"&priceMin=0&priceMax=900000000"
+        f"&areaMin=0&areaMax=900000000"
+        f"&oldBuildYears&recentlyBuildYears"
+        f"&minHouseHoldCount&maxHouseHoldCount"
+        f"&showArticle=false&sameAddressGroup=false"
+        f"&minMaintenanceCost&maxMaintenanceCost"
+        f"&priceType=RETAIL&directions="
+        f"&page={page}&articleState"
+    )
+
+
+async def _fetch_regions(
+    client: httpx.AsyncClient, cortar_no: str
+) -> list[dict]:
+    resp = await client.get(
+        REGION_ENDPOINT,
+        params={"cortarNo": cortar_no},
+        headers=make_headers(_creds.jwt, _creds.cookie),
+    )
+    if resp.status_code == 401:
+        raise TokenExpiredError()
+    resp.raise_for_status()
+    return resp.json().get("regionList", [])
+
+
+async def _fetch_list_page(
+    client: httpx.AsyncClient, cortar_no: str, page: int
+) -> dict:
+    resp = await client.get(
+        _build_list_url(cortar_no, page),
+        headers=make_headers(_creds.jwt, _creds.cookie),
+    )
+    if resp.status_code == 401:
+        raise TokenExpiredError()
+    resp.raise_for_status()
+    return resp.json()
+
+
+async def _fetch_detail_safe(
+    client: httpx.AsyncClient, article_no: str
+) -> dict | None:
+    """에러 처리 포함 단일 상세 조회. 401 → TokenExpiredError."""
+    try:
+        url  = DTL_ENDPOINT.format(no=article_no)
+        resp = await client.get(
+            url, headers=make_headers(_creds.jwt, _creds.cookie, article_no)
+        )
+        if resp.status_code == 401:
+            raise TokenExpiredError()
+        resp.raise_for_status()
+        detail = resp.json()
+        return detail if "error" not in detail else None
+    except TokenExpiredError:
+        raise
+    except Exception:
+        return None
+
+
+# ════════════════════════════════════════════════════════════════
+# 시/군/구 단위 비동기 크롤링
+# ════════════════════════════════════════════════════════════════
+
+async def _crawl_sigungu(
+    client:       httpx.AsyncClient,
+    sido_name:    str,
+    sigungu_name: str,
+    cortar_no:    str,
+) -> list[dict]:
+    """
+    시/군/구 단위 비동기 크롤링.
+
+    1단계: 목록 API → articleNo 수집 (순차)
+    2단계: 상세 API → DETAIL_BATCH건씩 asyncio.gather() 병렬 호출
+
+    수집된 레코드에 sido / sigungu / cortar_no 필드를 추가합니다.
+    """
+    label = f"{sido_name} {sigungu_name}"
+
+    # ── 1단계: 목록 수집 ────────────────────────────────────────────────────
+    article_nos: list[str] = []
+    page = 1
+    while True:
+        try:
+            data     = await _fetch_list_page(client, cortar_no, page)
+            articles = data.get("articleList", [])
+            article_nos.extend(str(a["articleNo"]) for a in articles)
+            if not articles or not data.get("isMoreData", False):
+                break
+            page += 1
+            await asyncio.sleep(DELAY_LIST)
+        except TokenExpiredError:
+            raise
+        except Exception as e:
+            print(f"    [목록 오류] {label} p{page}: {e}")
+            break
+
+    if not article_nos:
+        return []
+
+    total = len(article_nos)
+    print(f"  {label}: 매물 {total}건 → 상세 수집 중...")
+
+    # ── 2단계: 배치 병렬 상세 수집 ──────────────────────────────────────────
+    records: list[dict] = []
+
+    for i in range(0, total, DETAIL_BATCH):
+        batch = article_nos[i : i + DETAIL_BATCH]
+
+        # 401이 asyncio.gather 안에서 발생하면 위로 전파됨
+        results = await asyncio.gather(
+            *[_fetch_detail_safe(client, no) for no in batch],
+            return_exceptions=False,
+        )
+
+        for article_no, detail in zip(batch, results):
+            if detail:
+                rec = extract_record(article_no, detail)
+                # 지역 메타데이터 추가 (DB 저장용)
+                rec["sido"]      = sido_name
+                rec["sigungu"]   = sigungu_name
+                rec["dong"]      = ""
+                rec["cortar_no"] = cortar_no
+                records.append(rec)
+
+        await asyncio.sleep(DELAY_BATCH)
+
+    yield_cnt = sum(1 for r in records if r.get("수익률(%)") is not None)
+    print(f"  {label}: {len(records)}건 수집 (수익률 산출 {yield_cnt}건)")
+    return records
+
+
+# ════════════════════════════════════════════════════════════════
+# 메인 크롤링 루프
+# ════════════════════════════════════════════════════════════════
+
+async def main() -> None:
+    parser = argparse.ArgumentParser(description="전국 상가 일일 크롤러")
+    parser.add_argument(
+        "--sido",
+        metavar="시/도명",
+        help="특정 시/도만 크롤링합니다 (예: --sido 경기도). 미입력 시 전국.",
+    )
+    args = parser.parse_args()
+
+    # ── 환경변수 검증 ────────────────────────────────────────────────────────
+    for var in ("NAVER_NID_SES", "NAVER_NID_AUT", "SUPABASE_URL", "SUPABASE_KEY"):
+        if not os.environ.get(var):
+            print(f"ERROR: 환경변수 {var} 가 설정되지 않았습니다.")
+            sys.exit(1)
+
+    print("=" * 60)
+    print(f"크롤링 시작: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+    if args.sido:
+        print(f"대상: {args.sido}")
+    else:
+        last = get_last_crawl()
+        if last:
+            print(f"직전 크롤링: {last['finished_at']} ({last['total_count']:,}건)")
+    print("=" * 60)
+
+    # ── 1. JWT 자동 갱신 ────────────────────────────────────────────────────
+    await _refresh_jwt()
+
+    started_at    = datetime.now(timezone.utc)
+    total_records = 0
+    yield_records = 0
+    status        = "success"
+
+    async with httpx.AsyncClient(verify=False, timeout=30) as client:
+
+        # ── 2. 시/도 목록 조회 ────────────────────────────────────────────────
+        sido_list = await _fetch_regions(client, "0000000000")
+
+        if args.sido:
+            sido_list = [s for s in sido_list if s["cortarName"] == args.sido]
+            if not sido_list:
+                valid = ", ".join(s["cortarName"] for s in sido_list)
+                print(f"ERROR: '{args.sido}'를 찾을 수 없습니다.\n유효한 값: {valid}")
+                sys.exit(1)
+
+        print(f"대상 시/도: {len(sido_list)}개\n")
+
+        # ── 3. 시/도 순회 ─────────────────────────────────────────────────────
+        pending_records: list[dict] = []   # DB_UPSERT_EVERY건마다 flush
+
+        for sido in sido_list:
+            sido_name = sido["cortarName"]
+            print(f"\n{'─' * 50}")
+            print(f"[시/도] {sido_name}")
+            print(f"{'─' * 50}")
+
+            try:
+                sigungu_list = await _fetch_regions(client, sido["cortarNo"])
+            except Exception as e:
+                print(f"  시/군/구 목록 조회 실패: {e}")
+                status = "partial"
+                continue
+
+            # ── 4. 시/군/구 순회 ───────────────────────────────────────────────
+            for sigungu in sigungu_list:
+                sigungu_name = sigungu["cortarName"]
+                jwt_retried  = False
+
+                while True:
+                    try:
+                        records = await _crawl_sigungu(
+                            client,
+                            sido_name,
+                            sigungu_name,
+                            sigungu["cortarNo"],
+                        )
+                        pending_records.extend(records)
+
+                        # 일정 건수마다 DB UPSERT (메모리 관리 + 중단 시 데이터 보존)
+                        if len(pending_records) >= DB_UPSERT_EVERY:
+                            upserted = upsert_listings(pending_records)
+                            total_records += upserted
+                            yield_records += sum(
+                                1 for r in pending_records if r.get("수익률(%)")
+                            )
+                            print(f"  [DB] {upserted}건 저장 (누적 {total_records:,}건)")
+                            pending_records = []
+
+                        break  # 성공 → while 탈출
+
+                    except TokenExpiredError:
+                        if not jwt_retried:
+                            print(f"  [JWT 만료] {sigungu_name} — 자동 갱신 후 재시도...")
+                            await _refresh_jwt()
+                            jwt_retried = True
+                            # while 루프 계속 → 재시도
+                        else:
+                            print(f"  [JWT 만료] {sigungu_name} — 재갱신 실패, 건너뜀")
+                            status = "partial"
+                            break
+
+                    except Exception as e:
+                        print(f"  [{sigungu_name} 오류] {e}")
+                        break
+
+            # 시/도 완료 로그
+            print(f"\n[{sido_name}] 완료 — 누적 {total_records + len(pending_records):,}건")
+
+        # ── 남은 레코드 최종 UPSERT ────────────────────────────────────────────
+        if pending_records:
+            upserted = upsert_listings(pending_records)
+            total_records += upserted
+            yield_records += sum(1 for r in pending_records if r.get("수익률(%)"))
+            print(f"  [DB] 최종 {upserted}건 저장")
+
+    # ── 5. 크롤링 로그 저장 ──────────────────────────────────────────────────
+    finished_at = datetime.now(timezone.utc)
+    elapsed_min = int((finished_at - started_at).total_seconds() // 60)
+
+    insert_crawl_log({
+        "started_at":  started_at.isoformat(),
+        "finished_at": finished_at.isoformat(),
+        "total_count": total_records,
+        "yield_count": yield_records,
+        "status":      status,
+    })
+
+    print("\n" + "=" * 60)
+    print("크롤링 완료!")
+    print(f"  전체 매물   : {total_records:,}건")
+    print(f"  수익률 산출 : {yield_records:,}건")
+    print(f"  소요 시간   : {elapsed_min}분")
+    print(f"  상태        : {status}")
+    print("=" * 60)
+
+    if status != "success":
+        sys.exit(1)  # GitHub Actions에서 실패로 표시
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
