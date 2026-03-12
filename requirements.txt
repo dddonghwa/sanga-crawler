@@ -1,16 +1,10 @@
-# ── 크롤러 공통 (crawl.py, crawler_core.py, crawl_scheduled.py) ──────────────
-httpx==0.27.0
-python-dotenv>=1.0.0
-
-# ── JWT 자동 갱신 (jwt_refresh.py) ──────────────────────────────────────────
-playwright>=1.44.0
-# 설치 후 브라우저 바이너리도 설치 필요:
-#   playwright install chromium
-
-# ── DB 연동 (db.py) ──────────────────────────────────────────────────────────
-supabase>=2.4.0
-
-# ── Streamlit 웹 앱 (app.py, 개발/테스트용) ──────────────────────────────────
+# ── Streamlit 웹 앱 (app.py) ──────────────────────────────────────────────────
 streamlit>=1.32.0
+httpx==0.27.0
 pandas>=2.0.0
 openpyxl>=3.1.0
+python-dotenv>=1.0.0
+
+# ── 크롤러 스크립트 (로컬 실행용, Streamlit Cloud에서는 불필요) ──────────────
+# playwright>=1.44.0   # 설치 후 `playwright install chromium` 필요
+# supabase>=2.4.0
