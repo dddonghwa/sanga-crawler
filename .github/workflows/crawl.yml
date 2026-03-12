@@ -30,6 +30,7 @@ jobs:
     env:
       NAVER_NID_SES: ${{ secrets.NAVER_NID_SES }}
       NAVER_NID_AUT: ${{ secrets.NAVER_NID_AUT }}
+      NAVER_JWT:     ${{ secrets.NAVER_JWT }}
       SUPABASE_URL:  ${{ secrets.SUPABASE_URL }}
       SUPABASE_KEY:  ${{ secrets.SUPABASE_KEY }}
 

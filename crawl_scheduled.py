@@ -66,13 +66,24 @@ _creds = _Creds()
 
 
 async def _refresh_jwt() -> None:
-    """NID 쿠키로 JWT를 자동 갱신하고 _creds를 업데이트합니다."""
+    """
+    JWT를 갱신하고 _creds를 업데이트합니다.
+
+    NAVER_JWT 환경변수가 있으면 해당 값을 직접 사용합니다 (CI/CD 권장).
+    없으면 NID 쿠키로 Playwright를 통해 자동 추출합니다.
+    """
     nid_ses = os.environ["NAVER_NID_SES"]
     nid_aut = os.environ["NAVER_NID_AUT"]
-    print("  → JWT 자동 갱신 중 (약 10초)...")
-    _creds.jwt    = await get_fresh_jwt(nid_ses, nid_aut)
     _creds.cookie = f"NID_SES={nid_ses}; NID_AUT={nid_aut}"
-    print(f"  → JWT 갱신 완료 ({_creds.jwt[:40]}...)")
+
+    static_jwt = os.environ.get("NAVER_JWT", "").strip()
+    if static_jwt:
+        _creds.jwt = static_jwt
+        print(f"  → JWT 환경변수에서 로드 ({_creds.jwt[:40]}...)")
+    else:
+        print("  → JWT 자동 갱신 중 (약 10초)...")
+        _creds.jwt = await get_fresh_jwt(nid_ses, nid_aut)
+        print(f"  → JWT 갱신 완료 ({_creds.jwt[:40]}...)")
 
 
 # ════════════════════════════════════════════════════════════════
@@ -278,6 +289,8 @@ async def main() -> None:
         if not os.environ.get(var):
             print(f"ERROR: 환경변수 {var} 가 설정되지 않았습니다.")
             sys.exit(1)
+    if not os.environ.get("NAVER_JWT"):
+        print("INFO: NAVER_JWT 미설정 → Playwright로 JWT 자동 추출합니다.")
 
     print("=" * 60)
     print(f"크롤링 시작: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
