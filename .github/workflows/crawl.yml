@@ -1,0 +1,62 @@
+name: 전국 상가 크롤링
+
+on:
+  # 매일 02:00 KST (= 17:00 UTC)
+  schedule:
+    - cron: '0 17 * * *'
+
+  # 수동 실행 (특정 시/도만 테스트하거나 즉시 재실행할 때)
+  workflow_dispatch:
+    inputs:
+      sido:
+        description: '특정 시/도만 크롤링 (예: 경기도). 비워두면 전국.'
+        required: false
+        default: ''
+
+jobs:
+  crawl:
+    name: 상가 매물 수집 & DB 저장
+    runs-on: ubuntu-latest
+    timeout-minutes: 360 # 전국 크롤링 최대 6시간
+
+    env:
+      NAVER_NID_SES: ${{ secrets.NAVER_NID_SES }}
+      NAVER_NID_AUT: ${{ secrets.NAVER_NID_AUT }}
+      SUPABASE_URL:  ${{ secrets.SUPABASE_URL }}
+      SUPABASE_KEY:  ${{ secrets.SUPABASE_KEY }}
+
+    steps:
+      - name: 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: Python 3.12 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      # Streamlit 등 웹 전용 패키지는 크롤러에 불필요하므로 핵심 패키지만 설치
+      - name: 크롤러 의존성 설치
+        run: pip install httpx "playwright>=1.44.0" "supabase>=2.4.0"
+
+      - name: Playwright Chromium 설치
+        run: |
+          playwright install chromium
+          playwright install-deps chromium
+
+      # ── 전국 크롤링 (스케줄) ───────────────────────────────────────────────
+      - name: 전국 크롤링 실행
+        if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.sido == '')
+        run: python crawl_scheduled.py
+
+      # ── 특정 시/도 크롤링 (수동 입력 시) ────────────────────────────────────
+      - name: 시/도 크롤링 실행
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.sido != ''
+        run: python crawl_scheduled.py --sido "${{ github.event.inputs.sido }}"
+
+      # ── 실패 시 요약 출력 ─────────────────────────────────────────────────
+      - name: 실패 요약
+        if: failure()
+        run: |
+          echo "::error::크롤링 중 오류가 발생했습니다. 위 로그를 확인하세요."
+          echo "주요 원인: NID 쿠키 만료 / Supabase 연결 실패 / 네이버 API 변경"
