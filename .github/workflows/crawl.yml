@@ -44,7 +44,7 @@ jobs:
           cache: 'pip'
 
       - name: 크롤러 의존성 설치
-        run: pip install httpx "playwright>=1.44.0" "supabase>=2.4.0"
+        run: pip install httpx "playwright>=1.44.0" "supabase>=2.4.0" python-dotenv
 
       - name: Playwright Chromium 설치
         run: |
