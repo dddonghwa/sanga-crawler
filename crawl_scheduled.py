@@ -92,11 +92,20 @@ async def _refresh_jwt() -> None:
 
 async def _get_with_retry(client: httpx.AsyncClient, url: str, **kwargs) -> httpx.Response:
     """
-    429 Too Many Requests 발생 시 지수 백오프로 재시도합니다.
+    429 Too Many Requests 또는 ReadTimeout 발생 시 지수 백오프로 재시도합니다.
     Retry-After 헤더가 있으면 해당 값을 우선 사용합니다.
     """
+    last_exc: Exception | None = None
     for attempt in range(RETRY_MAX + 1):
-        resp = await client.get(url, **kwargs)
+        try:
+            resp = await client.get(url, **kwargs)
+        except httpx.ReadTimeout as e:
+            last_exc = e
+            wait = RETRY_BASE_WAIT * (2 ** attempt)
+            print(f"  [Timeout] 응답 없음. {wait:.0f}초 후 재시도 ({attempt + 1}/{RETRY_MAX})...")
+            await asyncio.sleep(wait)
+            continue
+
         if resp.status_code != 429:
             return resp
 
@@ -105,6 +114,8 @@ async def _get_with_retry(client: httpx.AsyncClient, url: str, **kwargs) -> http
         print(f"  [429] 요청 제한. {wait:.0f}초 후 재시도 ({attempt + 1}/{RETRY_MAX})...")
         await asyncio.sleep(wait)
 
+    if last_exc:
+        raise last_exc
     # 마지막 시도 결과 반환 (raise_for_status는 호출부에서)
     return resp
 
@@ -311,7 +322,7 @@ async def main() -> None:
     yield_records = 0
     status        = "success"
 
-    async with httpx.AsyncClient(verify=False, timeout=30) as client:
+    async with httpx.AsyncClient(verify=False, timeout=60) as client:
 
         # ── 2. 시/도 목록 조회 ────────────────────────────────────────────────
         sido_list = await _fetch_regions(client, "0000000000")
