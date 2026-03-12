@@ -42,9 +42,13 @@ from db import get_last_crawl, insert_crawl_log, upsert_listings
 from jwt_refresh import get_fresh_jwt
 
 # ── 병렬 처리 파라미터 ────────────────────────────────────────────────────────
-DETAIL_BATCH    = 10    # 동시 상세 요청 수 (429 위험 시 줄이세요)
-DELAY_BATCH     = 0.5   # 배치 완료 후 대기 (초)
+DETAIL_BATCH    = 1     # 동시 상세 요청 수 (429 위험 시 줄이세요)
+DELAY_BATCH     = 1.0   # 배치 완료 후 대기 (초)
 DB_UPSERT_EVERY = 200   # N건마다 Supabase UPSERT (메모리 관리)
+
+# ── 재시도 파라미터 ──────────────────────────────────────────────────────────
+RETRY_MAX       = 5     # 429 발생 시 최대 재시도 횟수
+RETRY_BASE_WAIT = 5.0   # 재시도 초기 대기 시간 (초, 지수 백오프)
 
 # ── URL 상수 ─────────────────────────────────────────────────────────────────
 _LIST_ENDPOINT = BASE + "/api/articles"
@@ -72,6 +76,29 @@ async def _refresh_jwt() -> None:
 
 
 # ════════════════════════════════════════════════════════════════
+# 429 재시도 헬퍼
+# ════════════════════════════════════════════════════════════════
+
+async def _get_with_retry(client: httpx.AsyncClient, url: str, **kwargs) -> httpx.Response:
+    """
+    429 Too Many Requests 발생 시 지수 백오프로 재시도합니다.
+    Retry-After 헤더가 있으면 해당 값을 우선 사용합니다.
+    """
+    for attempt in range(RETRY_MAX + 1):
+        resp = await client.get(url, **kwargs)
+        if resp.status_code != 429:
+            return resp
+
+        retry_after = resp.headers.get("Retry-After")
+        wait = float(retry_after) if retry_after else RETRY_BASE_WAIT * (2 ** attempt)
+        print(f"  [429] 요청 제한. {wait:.0f}초 후 재시도 ({attempt + 1}/{RETRY_MAX})...")
+        await asyncio.sleep(wait)
+
+    # 마지막 시도 결과 반환 (raise_for_status는 호출부에서)
+    return resp
+
+
+# ════════════════════════════════════════════════════════════════
 # 비동기 API 요청
 # ════════════════════════════════════════════════════════════════
 
@@ -96,7 +123,8 @@ def _build_list_url(cortar_no: str, page: int) -> str:
 async def _fetch_regions(
     client: httpx.AsyncClient, cortar_no: str
 ) -> list[dict]:
-    resp = await client.get(
+    resp = await _get_with_retry(
+        client,
         REGION_ENDPOINT,
         params={"cortarNo": cortar_no},
         headers=make_headers(_creds.jwt, _creds.cookie),
@@ -110,7 +138,8 @@ async def _fetch_regions(
 async def _fetch_list_page(
     client: httpx.AsyncClient, cortar_no: str, page: int
 ) -> dict:
-    resp = await client.get(
+    resp = await _get_with_retry(
+        client,
         _build_list_url(cortar_no, page),
         headers=make_headers(_creds.jwt, _creds.cookie),
     )
@@ -126,8 +155,8 @@ async def _fetch_detail_safe(
     """에러 처리 포함 단일 상세 조회. 401 → TokenExpiredError."""
     try:
         url  = DTL_ENDPOINT.format(no=article_no)
-        resp = await client.get(
-            url, headers=make_headers(_creds.jwt, _creds.cookie, article_no)
+        resp = await _get_with_retry(
+            client, url, headers=make_headers(_creds.jwt, _creds.cookie, article_no)
         )
         if resp.status_code == 401:
             raise TokenExpiredError()
