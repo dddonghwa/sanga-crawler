@@ -5,11 +5,19 @@ on:
   schedule:
     - cron: '0 17 * * *'
 
-  # 수동 실행 (특정 시/도만 테스트하거나 즉시 재실행할 때)
+  # 수동 실행 (특정 지역 테스트 또는 즉시 재실행)
   workflow_dispatch:
     inputs:
       sido:
-        description: '특정 시/도만 크롤링 (예: 경기도). 비워두면 전국.'
+        description: '시/도 (예: 경기도). 비워두면 전국.'
+        required: false
+        default: ''
+      sigungu:
+        description: '시/군/구 (예: 수원시 장안구). sido 입력 시에만 유효.'
+        required: false
+        default: ''
+      dong:
+        description: '읍/면/동 (예: 율전동). sido + sigungu 입력 시에만 유효.'
         required: false
         default: ''
 
@@ -35,7 +43,6 @@ jobs:
           python-version: '3.12'
           cache: 'pip'
 
-      # Streamlit 등 웹 전용 패키지는 크롤러에 불필요하므로 핵심 패키지만 설치
       - name: 크롤러 의존성 설치
         run: pip install httpx "playwright>=1.44.0" "supabase>=2.4.0"
 
@@ -44,17 +51,24 @@ jobs:
           playwright install chromium
           playwright install-deps chromium
 
-      # ── 전국 크롤링 (스케줄) ───────────────────────────────────────────────
-      - name: 전국 크롤링 실행
-        if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.sido == '')
-        run: python crawl_scheduled.py
+      - name: 크롤링 인수 조합
+        id: args
+        run: |
+          ARGS=""
+          if [ -n "${{ github.event.inputs.sido }}" ]; then
+            ARGS="$ARGS --sido '${{ github.event.inputs.sido }}'"
+          fi
+          if [ -n "${{ github.event.inputs.sigungu }}" ]; then
+            ARGS="$ARGS --sigungu '${{ github.event.inputs.sigungu }}'"
+          fi
+          if [ -n "${{ github.event.inputs.dong }}" ]; then
+            ARGS="$ARGS --dong '${{ github.event.inputs.dong }}'"
+          fi
+          echo "args=$ARGS" >> $GITHUB_OUTPUT
 
-      # ── 특정 시/도 크롤링 (수동 입력 시) ────────────────────────────────────
-      - name: 시/도 크롤링 실행
-        if: github.event_name == 'workflow_dispatch' && github.event.inputs.sido != ''
-        run: python crawl_scheduled.py --sido "${{ github.event.inputs.sido }}"
+      - name: 크롤링 실행
+        run: eval python crawl_scheduled.py ${{ steps.args.outputs.args }}
 
-      # ── 실패 시 요약 출력 ─────────────────────────────────────────────────
       - name: 실패 요약
         if: failure()
         run: |

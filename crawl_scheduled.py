@@ -219,7 +219,25 @@ async def main() -> None:
         metavar="시/도명",
         help="특정 시/도만 크롤링합니다 (예: --sido 경기도). 미입력 시 전국.",
     )
+    parser.add_argument(
+        "--sigungu",
+        metavar="시/군/구명",
+        help="특정 시/군/구만 크롤링합니다 (예: --sigungu '수원시 장안구'). --sido 와 함께 사용.",
+    )
+    parser.add_argument(
+        "--dong",
+        metavar="읍/면/동명",
+        help="특정 읍/면/동만 크롤링합니다 (예: --dong 율전동). --sido, --sigungu 와 함께 사용.",
+    )
     args = parser.parse_args()
+
+    # ── 인수 조합 검증 ────────────────────────────────────────────────────────
+    if args.sigungu and not args.sido:
+        print("ERROR: --sigungu 사용 시 --sido 도 함께 지정해야 합니다.")
+        sys.exit(1)
+    if args.dong and not args.sigungu:
+        print("ERROR: --dong 사용 시 --sigungu 도 함께 지정해야 합니다.")
+        sys.exit(1)
 
     # ── 환경변수 검증 ────────────────────────────────────────────────────────
     for var in ("NAVER_NID_SES", "NAVER_NID_AUT", "SUPABASE_URL", "SUPABASE_KEY"):
@@ -229,8 +247,9 @@ async def main() -> None:
 
     print("=" * 60)
     print(f"크롤링 시작: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
-    if args.sido:
-        print(f"대상: {args.sido}")
+    target_parts = [p for p in [args.sido, args.sigungu, args.dong] if p]
+    if target_parts:
+        print(f"대상: {' '.join(target_parts)}")
     else:
         last = get_last_crawl()
         if last:
@@ -251,11 +270,12 @@ async def main() -> None:
         sido_list = await _fetch_regions(client, "0000000000")
 
         if args.sido:
-            sido_list = [s for s in sido_list if s["cortarName"] == args.sido]
-            if not sido_list:
+            sido_list_filtered = [s for s in sido_list if s["cortarName"] == args.sido]
+            if not sido_list_filtered:
                 valid = ", ".join(s["cortarName"] for s in sido_list)
                 print(f"ERROR: '{args.sido}'를 찾을 수 없습니다.\n유효한 값: {valid}")
                 sys.exit(1)
+            sido_list = sido_list_filtered
 
         print(f"대상 시/도: {len(sido_list)}개\n")
 
@@ -275,47 +295,77 @@ async def main() -> None:
                 status = "partial"
                 continue
 
+            # --sigungu 필터
+            if args.sigungu:
+                sigungu_list = [s for s in sigungu_list if s["cortarName"] == args.sigungu]
+                if not sigungu_list:
+                    print(f"ERROR: '{args.sigungu}'를 찾을 수 없습니다.")
+                    sys.exit(1)
+
             # ── 4. 시/군/구 순회 ───────────────────────────────────────────────
             for sigungu in sigungu_list:
                 sigungu_name = sigungu["cortarName"]
-                jwt_retried  = False
 
-                while True:
+                # --dong 지정 시 동 단위로 한 단계 더 내려가서 크롤링
+                if args.dong:
                     try:
-                        records = await _crawl_sigungu(
-                            client,
-                            sido_name,
-                            sigungu_name,
-                            sigungu["cortarNo"],
-                        )
-                        pending_records.extend(records)
-
-                        # 일정 건수마다 DB UPSERT (메모리 관리 + 중단 시 데이터 보존)
-                        if len(pending_records) >= DB_UPSERT_EVERY:
-                            upserted = upsert_listings(pending_records)
-                            total_records += upserted
-                            yield_records += sum(
-                                1 for r in pending_records if r.get("수익률(%)")
-                            )
-                            print(f"  [DB] {upserted}건 저장 (누적 {total_records:,}건)")
-                            pending_records = []
-
-                        break  # 성공 → while 탈출
-
-                    except TokenExpiredError:
-                        if not jwt_retried:
-                            print(f"  [JWT 만료] {sigungu_name} — 자동 갱신 후 재시도...")
-                            await _refresh_jwt()
-                            jwt_retried = True
-                            # while 루프 계속 → 재시도
-                        else:
-                            print(f"  [JWT 만료] {sigungu_name} — 재갱신 실패, 건너뜀")
-                            status = "partial"
-                            break
-
+                        dong_list = await _fetch_regions(client, sigungu["cortarNo"])
                     except Exception as e:
-                        print(f"  [{sigungu_name} 오류] {e}")
-                        break
+                        print(f"  읍/면/동 목록 조회 실패: {e}")
+                        status = "partial"
+                        continue
+
+                    dong_list = [d for d in dong_list if d["cortarName"] == args.dong]
+                    if not dong_list:
+                        print(f"ERROR: '{args.dong}'를 찾을 수 없습니다.")
+                        sys.exit(1)
+
+                    crawl_targets = [
+                        (f"{sigungu_name} {d['cortarName']}", d["cortarNo"])
+                        for d in dong_list
+                    ]
+                else:
+                    crawl_targets = [(sigungu_name, sigungu["cortarNo"])]
+
+                for crawl_label, crawl_cortar in crawl_targets:
+                    jwt_retried = False
+
+                    while True:
+                        try:
+                            records = await _crawl_sigungu(
+                                client,
+                                sido_name,
+                                crawl_label,
+                                crawl_cortar,
+                            )
+                            pending_records.extend(records)
+
+                            # 일정 건수마다 DB UPSERT (메모리 관리 + 중단 시 데이터 보존)
+                            if len(pending_records) >= DB_UPSERT_EVERY:
+                                upserted = upsert_listings(pending_records)
+                                total_records += upserted
+                                yield_records += sum(
+                                    1 for r in pending_records if r.get("수익률(%)")
+                                )
+                                print(f"  [DB] {upserted}건 저장 (누적 {total_records:,}건)")
+                                pending_records = []
+
+                            break  # 성공 → while 탈출
+
+                        except TokenExpiredError:
+                            if not jwt_retried:
+                                print(f"  [JWT 만료] {crawl_label} — 자동 갱신 후 재시도...")
+                                await _refresh_jwt()
+                                jwt_retried = True
+                                # while 루프 계속 → 재시도
+                            else:
+                                print(f"  [JWT 만료] {crawl_label} — 재갱신 실패, 건너뜀")
+                                status = "partial"
+                                break
+
+                        except Exception as e:
+                            print(f"  [{crawl_label} 오류] {e}")
+                            break
 
             # 시/도 완료 로그
             print(f"\n[{sido_name}] 완료 — 누적 {total_records + len(pending_records):,}건")
