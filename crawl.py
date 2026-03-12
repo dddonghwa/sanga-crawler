@@ -23,6 +23,11 @@ import sys
 from datetime import datetime
 
 import httpx
+from dotenv import load_dotenv
+
+# .env 파일이 있으면 로드 (로컬 개발용).
+# 이미 설정된 환경변수는 덮어쓰지 않음.
+load_dotenv(override=False)
 
 # ── 인증 정보 (환경변수) ─────────────────────────────────────────────────────
 NAVER_COOKIE = os.environ.get("NAVER_COOKIE", "")

@@ -23,6 +23,11 @@ import sys
 from datetime import datetime, timezone
 
 import httpx
+from dotenv import load_dotenv
+
+# .env 파일이 있으면 로드 (로컬 개발용).
+# 이미 설정된 환경변수(GitHub Actions secrets 등)는 덮어쓰지 않음.
+load_dotenv(override=False)
 
 from crawler_core import (
     BASE,
