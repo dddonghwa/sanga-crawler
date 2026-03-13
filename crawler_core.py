@@ -98,12 +98,14 @@ def calculate_yield(매매가: float, 보증금: float, 월세: float) -> float 
 # ════════════════════════════════════════════════════════════════
 
 def extract_record(article_no: str, detail: dict) -> dict:
-    d = detail.get("articleDetail",   {})
-    p = detail.get("articlePrice",    {})
-    s = detail.get("articleSpace",    {})
-    f = detail.get("articleFloor",    {})
-    a = detail.get("articleAddition", {})
-    r = detail.get("articleRealtor",  {})
+    d   = detail.get("articleDetail",          {})
+    p   = detail.get("articlePrice",           {})
+    s   = detail.get("articleSpace",           {})
+    f   = detail.get("articleFloor",           {})
+    a   = detail.get("articleAddition",        {})
+    r   = detail.get("articleRealtor",         {})
+    fac = detail.get("articleFacility",        {})
+    b   = detail.get("articleBuildingRegister",{})
 
     매매가 = p.get("dealPrice",       0) or 0
     보증금 = p.get("allWarrantPrice", 0) or 0
@@ -124,6 +126,28 @@ def extract_record(article_no: str, detail: dict) -> dict:
         "방향":           a.get("direction", ""),
         "중개사":         r.get("realtorName", ""),
         "상세정보":       f"https://fin.land.naver.com/articles/{article_no}",
+
+        # 002_add_columns.sql 추가 필드
+        "매물노출시작일":  d.get("exposeStartYMD", ""),
+        "현재용도":        b.get("mainPurpsCdNm", ""),
+        "법정용도":        d.get("lawUsage", ""),
+        "건축승인일":      fac.get("buildingUseAprvYmd", ""),
+        "건물구조":        b.get("strctCdNm", ""),
+        "지하층수":        b.get("ugrndFlrCnt"),
+        "연면적(㎡)":      b.get("totArea"),
+        "전용률(%)":       s.get("exclusiveRate"),
+        "월관리비(원)":    d.get("monthlyManagementCost"),
+        "융자금(만원)":    p.get("financePrice"),
+        "지하철도보(분)":  d.get("walkingTimeToNearSubway"),
+        "주차대수":        d.get("parkingCount"),
+        "태그목록":        d.get("tagList", []),
+        "상세설명":        d.get("detailDescription", ""),
+        "중개사대표전화":  r.get("representativeTelNo", ""),
+        "중개사휴대폰":    r.get("cellPhoneNo", ""),
+
+        # 좌표 (Phase 3 대기 없이 API에서 직접 수집)
+        "위도":            d.get("latitude"),
+        "경도":            d.get("longitude"),
     }
 
 

@@ -77,9 +77,27 @@ def _to_db_row(record: dict) -> dict:
         # 링크
         "detail_url":     record.get("상세정보"),
 
-        # 지도 (Phase 3, 현재는 null)
-        "latitude":       None,
-        "longitude":      None,
+        # 지도 좌표 (API에서 직접 수집)
+        "latitude":       _num(record.get("위도")),
+        "longitude":      _num(record.get("경도")),
+
+        # 002_add_columns.sql 추가 필드
+        "expose_start_ymd":    record.get("매물노출시작일") or None,
+        "current_usage":       record.get("현재용도") or None,
+        "law_usage":           record.get("법정용도") or None,
+        "building_approve_ymd": record.get("건축승인일") or None,
+        "structure_name":      record.get("건물구조") or None,
+        "underground_floors":  _int(record.get("지하층수")),
+        "total_area":          _num(record.get("연면적(㎡)")),
+        "exclusive_rate":      _num(record.get("전용률(%)")),
+        "monthly_mgmt_cost":   _int(record.get("월관리비(원)")),
+        "finance_price":       _int(record.get("융자금(만원)")),
+        "walking_to_subway":   _int(record.get("지하철도보(분)")),
+        "parking_count":       _int(record.get("주차대수")),
+        "tag_list":            record.get("태그목록") or [],
+        "detail_description":  record.get("상세설명") or None,
+        "realtor_tel":         record.get("중개사대표전화") or None,
+        "realtor_cell":        record.get("중개사휴대폰") or None,
     }
 
 
